@@ -1,9 +1,9 @@
 import { flatten } from 'lodash'
 import { DataType, ErrorCode, MetricType, IndexType } from '@zilliz/milvus2-sdk-node'
-import { Document } from 'langchain/document'
-import { MilvusLibArgs, Milvus } from 'langchain/vectorstores/milvus'
-import { Embeddings } from 'langchain/embeddings/base'
-import { ICommonObject, INode, INodeData, INodeOutputsValue, INodeParams } from '../../../src/Interface'
+import { Document } from '@langchain/core/documents'
+import { MilvusLibArgs, Milvus } from '@langchain/community/vectorstores/milvus'
+import { Embeddings } from '@langchain/core/embeddings'
+import { ICommonObject, INode, INodeData, INodeOutputsValue, INodeParams, IndexingResult } from '../../../src/Interface'
 import { getBaseClasses, getCredentialData, getCredentialParam } from '../../../src/utils'
 
 interface InsertRow {
@@ -66,6 +66,14 @@ class Milvus_VectorStores implements INode {
                 type: 'string'
             },
             {
+                label: 'Milvus Text Field',
+                name: 'milvusTextField',
+                type: 'string',
+                placeholder: 'langchain_text',
+                optional: true,
+                additionalParams: true
+            },
+            {
                 label: 'Milvus Filter',
                 name: 'milvusFilter',
                 type: 'string',
@@ -101,7 +109,7 @@ class Milvus_VectorStores implements INode {
 
     //@ts-ignore
     vectorStoreMethods = {
-        async upsert(nodeData: INodeData, options: ICommonObject): Promise<void> {
+        async upsert(nodeData: INodeData, options: ICommonObject): Promise<Partial<IndexingResult>> {
             // server setup
             const address = nodeData.inputs?.milvusServerUrl as string
             const collectionName = nodeData.inputs?.milvusCollection as string
@@ -139,6 +147,8 @@ class Milvus_VectorStores implements INode {
                 vectorStore.similaritySearchVectorWithScore = async (query: number[], k: number, filter?: string) => {
                     return await similaritySearchVectorWithScore(query, k, vectorStore, undefined, filter)
                 }
+
+                return { numAdded: finalDocs.length, addedDocs: finalDocs }
             } catch (e) {
                 throw new Error(e)
             }
@@ -150,6 +160,7 @@ class Milvus_VectorStores implements INode {
         const address = nodeData.inputs?.milvusServerUrl as string
         const collectionName = nodeData.inputs?.milvusCollection as string
         const milvusFilter = nodeData.inputs?.milvusFilter as string
+        const textField = nodeData.inputs?.milvusTextField as string
 
         // embeddings
         const embeddings = nodeData.inputs?.embeddings as Embeddings
@@ -169,7 +180,8 @@ class Milvus_VectorStores implements INode {
         // init MilvusLibArgs
         const milVusArgs: MilvusLibArgs = {
             url: address,
-            collectionName: collectionName
+            collectionName: collectionName,
+            textField: textField
         }
 
         if (milvusUser) milVusArgs.username = milvusUser
@@ -187,6 +199,9 @@ class Milvus_VectorStores implements INode {
             return retriever
         } else if (output === 'vectorStore') {
             ;(vectorStore as any).k = k
+            if (milvusFilter) {
+                ;(vectorStore as any).filter = milvusFilter
+            }
             return vectorStore
         }
         return vectorStore
