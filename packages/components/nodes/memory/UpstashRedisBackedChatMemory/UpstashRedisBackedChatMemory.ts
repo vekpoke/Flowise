@@ -80,7 +80,7 @@ class UpstashRedisBackedChatMemory_Memory implements INode {
                 label: 'Session Timeouts',
                 name: 'sessionTTL',
                 type: 'number',
-                description: 'Omit this parameter to make sessions never expire',
+                description: 'Seconds till a session expires. If not specified, the session will never expire.',
                 additionalParams: true,
                 optional: true
             },
@@ -162,7 +162,7 @@ class BufferMemoryExtended extends FlowiseMemory implements MemoryMethods {
         const previousMessages = orderedMessages.filter((x): x is StoredMessage => x.type !== undefined && x.data.content !== undefined)
         const baseMessages = previousMessages.map(mapStoredMessageToChatMessage)
         if (prependMessages?.length) {
-            baseMessages.unshift(...mapChatMessageToBaseMessage(prependMessages))
+            baseMessages.unshift(...(await mapChatMessageToBaseMessage(prependMessages)))
         }
         return returnBaseMessages ? baseMessages : convertBaseMessagetoIMessage(baseMessages)
     }

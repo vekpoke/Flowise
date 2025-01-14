@@ -1,29 +1,40 @@
 import { Logger } from 'winston'
 import { v4 as uuidv4 } from 'uuid'
-import { Server } from 'socket.io'
 import { Client } from 'langsmith'
 import CallbackHandler from 'langfuse-langchain'
 import lunary from 'lunary'
 import { RunTree, RunTreeConfig, Client as LangsmithClient } from 'langsmith'
 import { Langfuse, LangfuseTraceClient, LangfuseSpanClient, LangfuseGenerationClient } from 'langfuse'
 
-import { BaseCallbackHandler } from '@langchain/core/callbacks/base'
+import { BaseCallbackHandler, NewTokenIndices, HandleLLMNewTokenCallbackFields } from '@langchain/core/callbacks/base'
 import { LangChainTracer, LangChainTracerFields } from '@langchain/core/tracers/tracer_langchain'
 import { BaseTracer, Run } from '@langchain/core/tracers/base'
 import { ChainValues } from '@langchain/core/utils/types'
 import { AgentAction } from '@langchain/core/agents'
 import { LunaryHandler } from '@langchain/community/callbacks/handlers/lunary'
 
-import { getCredentialData, getCredentialParam } from './utils'
-import { ICommonObject, INodeData } from './Interface'
+import { getCredentialData, getCredentialParam, getEnvironmentVariable } from './utils'
+import { ICommonObject, IDatabaseEntity, INodeData, IServerSideEventStreamer } from './Interface'
+import { LangWatch, LangWatchSpan, LangWatchTrace, autoconvertTypedValues } from 'langwatch'
+import { DataSource } from 'typeorm'
+import { ChatGenerationChunk } from '@langchain/core/outputs'
+import { AIMessageChunk } from '@langchain/core/messages'
 
 interface AgentRun extends Run {
     actions: AgentAction[]
 }
 
+function tryGetJsonSpaces() {
+    try {
+        return parseInt(getEnvironmentVariable('LOG_JSON_SPACES') ?? '2')
+    } catch (err) {
+        return 2
+    }
+}
+
 function tryJsonStringify(obj: unknown, fallback: string) {
     try {
-        return JSON.stringify(obj, null, 2)
+        return JSON.stringify(obj, null, tryGetJsonSpaces())
     } catch (err) {
         return fallback
     }
@@ -49,9 +60,10 @@ export class ConsoleCallbackHandler extends BaseTracer {
     constructor(logger: Logger) {
         super()
         this.logger = logger
+        if (getEnvironmentVariable('DEBUG') === 'true') {
+            logger.level = getEnvironmentVariable('LOG_LEVEL') ?? 'info'
+        }
     }
-
-    // utility methods
 
     getParents(run: Run) {
         const parents: Run[] = []
@@ -79,10 +91,9 @@ export class ConsoleCallbackHandler extends BaseTracer {
         return string
     }
 
-    // logging methods
-
     onChainStart(run: Run) {
         const crumbs = this.getBreadcrumbs(run)
+
         this.logger.verbose(`[chain/start] [${crumbs}] Entering Chain run with input: ${tryJsonStringify(run.inputs, '[inputs]')}`)
     }
 
@@ -155,16 +166,16 @@ export class ConsoleCallbackHandler extends BaseTracer {
 export class CustomChainHandler extends BaseCallbackHandler {
     name = 'custom_chain_handler'
     isLLMStarted = false
-    socketIO: Server
-    socketIOClientId = ''
     skipK = 0 // Skip streaming for first K numbers of handleLLMStart
     returnSourceDocuments = false
     cachedResponse = true
+    chatId: string = ''
+    sseStreamer: IServerSideEventStreamer | undefined
 
-    constructor(socketIO: Server, socketIOClientId: string, skipK?: number, returnSourceDocuments?: boolean) {
+    constructor(sseStreamer: IServerSideEventStreamer | undefined, chatId: string, skipK?: number, returnSourceDocuments?: boolean) {
         super()
-        this.socketIO = socketIO
-        this.socketIOClientId = socketIOClientId
+        this.sseStreamer = sseStreamer
+        this.chatId = chatId
         this.skipK = skipK ?? this.skipK
         this.returnSourceDocuments = returnSourceDocuments ?? this.returnSourceDocuments
     }
@@ -174,18 +185,40 @@ export class CustomChainHandler extends BaseCallbackHandler {
         if (this.skipK > 0) this.skipK -= 1
     }
 
-    handleLLMNewToken(token: string) {
+    handleLLMNewToken(
+        token: string,
+        idx?: NewTokenIndices,
+        runId?: string,
+        parentRunId?: string,
+        tags?: string[],
+        fields?: HandleLLMNewTokenCallbackFields
+    ): void | Promise<void> {
         if (this.skipK === 0) {
             if (!this.isLLMStarted) {
                 this.isLLMStarted = true
-                this.socketIO.to(this.socketIOClientId).emit('start', token)
+                if (this.sseStreamer) {
+                    this.sseStreamer.streamStartEvent(this.chatId, token)
+                }
             }
-            this.socketIO.to(this.socketIOClientId).emit('token', token)
+            if (this.sseStreamer) {
+                if (token) {
+                    const chunk = fields?.chunk as ChatGenerationChunk
+                    const message = chunk?.message as AIMessageChunk
+                    const toolCalls = message?.tool_call_chunks || []
+
+                    // Only stream when token is not empty and not a tool call
+                    if (toolCalls.length === 0) {
+                        this.sseStreamer.streamTokenEvent(this.chatId, token)
+                    }
+                }
+            }
         }
     }
 
     handleLLMEnd() {
-        this.socketIO.to(this.socketIOClientId).emit('end')
+        if (this.sseStreamer) {
+            this.sseStreamer.streamEndEvent(this.chatId)
+        }
     }
 
     handleChainEnd(outputs: ChainValues, _: string, parentRunId?: string): void | Promise<void> {
@@ -200,19 +233,104 @@ export class CustomChainHandler extends BaseCallbackHandler {
             const result = cachedValue.split(/(\s+)/)
             result.forEach((token: string, index: number) => {
                 if (index === 0) {
-                    this.socketIO.to(this.socketIOClientId).emit('start', token)
+                    if (this.sseStreamer) {
+                        this.sseStreamer.streamStartEvent(this.chatId, token)
+                    }
                 }
-                this.socketIO.to(this.socketIOClientId).emit('token', token)
+                if (this.sseStreamer) {
+                    this.sseStreamer.streamTokenEvent(this.chatId, token)
+                }
             })
-            if (this.returnSourceDocuments) {
-                this.socketIO.to(this.socketIOClientId).emit('sourceDocuments', outputs?.sourceDocuments)
+            if (this.returnSourceDocuments && this.sseStreamer) {
+                this.sseStreamer.streamSourceDocumentsEvent(this.chatId, outputs?.sourceDocuments)
             }
-            this.socketIO.to(this.socketIOClientId).emit('end')
+            if (this.sseStreamer) {
+                this.sseStreamer.streamEndEvent(this.chatId)
+            }
         } else {
-            if (this.returnSourceDocuments) {
-                this.socketIO.to(this.socketIOClientId).emit('sourceDocuments', outputs?.sourceDocuments)
+            if (this.returnSourceDocuments && this.sseStreamer) {
+                this.sseStreamer.streamSourceDocumentsEvent(this.chatId, outputs?.sourceDocuments)
             }
         }
+    }
+}
+
+class ExtendedLunaryHandler extends LunaryHandler {
+    chatId: string
+    appDataSource: DataSource
+    databaseEntities: IDatabaseEntity
+    currentRunId: string | null
+    thread: any
+    apiMessageId: string
+
+    constructor({ flowiseOptions, ...options }: any) {
+        super(options)
+        this.appDataSource = flowiseOptions.appDataSource
+        this.databaseEntities = flowiseOptions.databaseEntities
+        this.chatId = flowiseOptions.chatId
+        this.apiMessageId = flowiseOptions.apiMessageId
+    }
+
+    async initThread() {
+        const entity = await this.appDataSource.getRepository(this.databaseEntities['Lead']).findOne({
+            where: {
+                chatId: this.chatId
+            }
+        })
+
+        const userId = entity?.email ?? entity?.id
+
+        this.thread = lunary.openThread({
+            id: this.chatId,
+            userId,
+            userProps: userId
+                ? {
+                      name: entity?.name ?? undefined,
+                      email: entity?.email ?? undefined,
+                      phone: entity?.phone ?? undefined
+                  }
+                : undefined
+        })
+    }
+
+    async handleChainStart(chain: any, inputs: any, runId: string, parentRunId?: string, tags?: string[], metadata?: any): Promise<void> {
+        // First chain (no parent run id) is the user message
+        if (this.chatId && !parentRunId) {
+            if (!this.thread) {
+                await this.initThread()
+            }
+
+            const messageText = inputs.input || inputs.question
+
+            const messageId = this.thread.trackMessage({
+                content: messageText,
+                role: 'user'
+            })
+
+            // Track top level chain id for knowing when we got the final reply
+            this.currentRunId = runId
+
+            // Use the messageId as the parent of the chain for reconciliation
+            super.handleChainStart(chain, inputs, runId, messageId, tags, metadata)
+        } else {
+            super.handleChainStart(chain, inputs, runId, parentRunId, tags, metadata)
+        }
+    }
+
+    async handleChainEnd(outputs: ChainValues, runId: string): Promise<void> {
+        if (this.chatId && runId === this.currentRunId) {
+            const answer = outputs.output
+
+            this.thread.trackMessage({
+                id: this.apiMessageId,
+                content: answer,
+                role: 'assistant'
+            })
+
+            this.currentRunId = null
+        }
+
+        super.handleChainEnd(outputs, runId)
     }
 }
 
@@ -274,20 +392,34 @@ export const additionalCallbacks = async (nodeData: INodeData, options: ICommonO
                     const handler = new CallbackHandler(langFuseOptions)
                     callbacks.push(handler)
                 } else if (provider === 'lunary') {
-                    const lunaryAppId = getCredentialParam('lunaryAppId', credentialData, nodeData)
+                    const lunaryPublicKey = getCredentialParam('lunaryAppId', credentialData, nodeData)
                     const lunaryEndpoint = getCredentialParam('lunaryEndpoint', credentialData, nodeData)
 
                     let lunaryFields = {
-                        appId: lunaryAppId,
-                        apiUrl: lunaryEndpoint ?? 'https://app.lunary.ai'
+                        publicKey: lunaryPublicKey,
+                        apiUrl: lunaryEndpoint ?? 'https://api.lunary.ai',
+                        runtime: 'flowise',
+                        flowiseOptions: options
                     }
 
                     if (nodeData?.inputs?.analytics?.lunary) {
                         lunaryFields = { ...lunaryFields, ...nodeData?.inputs?.analytics?.lunary }
                     }
 
-                    const handler = new LunaryHandler(lunaryFields)
+                    const handler = new ExtendedLunaryHandler(lunaryFields)
+
                     callbacks.push(handler)
+                } else if (provider === 'langWatch') {
+                    const langWatchApiKey = getCredentialParam('langWatchApiKey', credentialData, nodeData)
+                    const langWatchEndpoint = getCredentialParam('langWatchEndpoint', credentialData, nodeData)
+
+                    const langwatch = new LangWatch({
+                        apiKey: langWatchApiKey,
+                        endpoint: langWatchEndpoint
+                    })
+
+                    const trace = langwatch.getTrace()
+                    callbacks.push(trace.getLangChainCallback())
                 }
             }
         }
@@ -346,15 +478,26 @@ export class AnalyticHandler {
                         })
                         this.handlers['langFuse'] = { client: langfuse }
                     } else if (provider === 'lunary') {
-                        const lunaryAppId = getCredentialParam('lunaryAppId', credentialData, this.nodeData)
+                        const lunaryPublicKey = getCredentialParam('lunaryAppId', credentialData, this.nodeData)
                         const lunaryEndpoint = getCredentialParam('lunaryEndpoint', credentialData, this.nodeData)
 
                         lunary.init({
-                            appId: lunaryAppId,
-                            apiUrl: lunaryEndpoint
+                            publicKey: lunaryPublicKey,
+                            apiUrl: lunaryEndpoint,
+                            runtime: 'flowise'
                         })
 
                         this.handlers['lunary'] = { client: lunary }
+                    } else if (provider === 'langWatch') {
+                        const langWatchApiKey = getCredentialParam('langWatchApiKey', credentialData, this.nodeData)
+                        const langWatchEndpoint = getCredentialParam('langWatchEndpoint', credentialData, this.nodeData)
+
+                        const langwatch = new LangWatch({
+                            apiKey: langWatchApiKey,
+                            endpoint: langWatchEndpoint
+                        })
+
+                        this.handlers['langWatch'] = { client: langwatch }
                     }
                 }
             }
@@ -367,7 +510,8 @@ export class AnalyticHandler {
         const returnIds: ICommonObject = {
             langSmith: {},
             langFuse: {},
-            lunary: {}
+            lunary: {},
+            langWatch: {}
         }
 
         if (Object.prototype.hasOwnProperty.call(this.handlers, 'langSmith')) {
@@ -446,12 +590,38 @@ export class AnalyticHandler {
                 await monitor.trackEvent('chain', 'start', {
                     runId,
                     name,
-                    userId: this.options.chatId,
                     input,
                     ...this.nodeData?.inputs?.analytics?.lunary
                 })
                 this.handlers['lunary'].chainEvent = { [runId]: runId }
                 returnIds['lunary'].chainEvent = runId
+            }
+        }
+
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'langWatch')) {
+            let langwatchTrace: LangWatchTrace
+
+            if (!parentIds || !Object.keys(parentIds).length) {
+                const langwatch: LangWatch = this.handlers['langWatch'].client
+                langwatchTrace = langwatch.getTrace({
+                    name,
+                    metadata: { tags: ['openai-assistant'], threadId: this.options.chatId },
+                    ...this.nodeData?.inputs?.analytics?.langWatch
+                })
+            } else {
+                langwatchTrace = this.handlers['langWatch'].trace[parentIds['langWatch']]
+            }
+
+            if (langwatchTrace) {
+                const span = langwatchTrace.startSpan({
+                    name,
+                    type: 'chain',
+                    input: autoconvertTypedValues(input)
+                })
+                this.handlers['langWatch'].trace = { [langwatchTrace.traceId]: langwatchTrace }
+                this.handlers['langWatch'].span = { [span.spanId]: span }
+                returnIds['langWatch'].trace = langwatchTrace.traceId
+                returnIds['langWatch'].span = span.spanId
             }
         }
 
@@ -500,6 +670,15 @@ export class AnalyticHandler {
                 await monitor.trackEvent('chain', 'end', {
                     runId: chainEventId,
                     output
+                })
+            }
+        }
+
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'langWatch')) {
+            const span: LangWatchSpan | undefined = this.handlers['langWatch'].span[returnIds['langWatch'].span]
+            if (span) {
+                span.end({
+                    output: autoconvertTypedValues(output)
                 })
             }
         }
@@ -552,13 +731,23 @@ export class AnalyticHandler {
                 })
             }
         }
+
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'langWatch')) {
+            const span: LangWatchSpan | undefined = this.handlers['langWatch'].span[returnIds['langWatch'].span]
+            if (span) {
+                span.end({
+                    error
+                })
+            }
+        }
     }
 
     async onLLMStart(name: string, input: string, parentIds: ICommonObject) {
         const returnIds: ICommonObject = {
             langSmith: {},
             langFuse: {},
-            lunary: {}
+            lunary: {},
+            langWatch: {}
         }
 
         if (Object.prototype.hasOwnProperty.call(this.handlers, 'langSmith')) {
@@ -599,11 +788,22 @@ export class AnalyticHandler {
                     runId,
                     parentRunId: chainEventId,
                     name,
-                    userId: this.options.chatId,
                     input
                 })
                 this.handlers['lunary'].llmEvent = { [runId]: runId }
                 returnIds['lunary'].llmEvent = runId
+            }
+        }
+
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'langWatch')) {
+            const trace: LangWatchTrace | undefined = this.handlers['langWatch'].trace[parentIds['langWatch'].trace]
+            if (trace) {
+                const span = trace.startLLMSpan({
+                    name,
+                    input: autoconvertTypedValues(input)
+                })
+                this.handlers['langWatch'].span = { [span.spanId]: span }
+                returnIds['langWatch'].span = span.spanId
             }
         }
 
@@ -643,6 +843,15 @@ export class AnalyticHandler {
                 })
             }
         }
+
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'langWatch')) {
+            const span: LangWatchSpan | undefined = this.handlers['langWatch'].span[returnIds['langWatch'].span]
+            if (span) {
+                span.end({
+                    output: autoconvertTypedValues(output)
+                })
+            }
+        }
     }
 
     async onLLMError(returnIds: ICommonObject, error: string | object) {
@@ -678,13 +887,23 @@ export class AnalyticHandler {
                 })
             }
         }
+
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'langWatch')) {
+            const span: LangWatchSpan | undefined = this.handlers['langWatch'].span[returnIds['langWatch'].span]
+            if (span) {
+                span.end({
+                    error
+                })
+            }
+        }
     }
 
     async onToolStart(name: string, input: string | object, parentIds: ICommonObject) {
         const returnIds: ICommonObject = {
             langSmith: {},
             langFuse: {},
-            lunary: {}
+            lunary: {},
+            langWatch: {}
         }
 
         if (Object.prototype.hasOwnProperty.call(this.handlers, 'langSmith')) {
@@ -725,11 +944,23 @@ export class AnalyticHandler {
                     runId,
                     parentRunId: chainEventId,
                     name,
-                    userId: this.options.chatId,
                     input
                 })
                 this.handlers['lunary'].toolEvent = { [runId]: runId }
                 returnIds['lunary'].toolEvent = runId
+            }
+        }
+
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'langWatch')) {
+            const trace: LangWatchTrace | undefined = this.handlers['langWatch'].trace[parentIds['langWatch'].trace]
+            if (trace) {
+                const span = trace.startSpan({
+                    name,
+                    type: 'tool',
+                    input: autoconvertTypedValues(input)
+                })
+                this.handlers['langWatch'].span = { [span.spanId]: span }
+                returnIds['langWatch'].span = span.spanId
             }
         }
 
@@ -769,6 +1000,15 @@ export class AnalyticHandler {
                 })
             }
         }
+
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'langWatch')) {
+            const span: LangWatchSpan | undefined = this.handlers['langWatch'].span[returnIds['langWatch'].span]
+            if (span) {
+                span.end({
+                    output: autoconvertTypedValues(output)
+                })
+            }
+        }
     }
 
     async onToolError(returnIds: ICommonObject, error: string | object) {
@@ -801,6 +1041,15 @@ export class AnalyticHandler {
                 await monitor.trackEvent('tool', 'end', {
                     runId: toolEventId,
                     output: error
+                })
+            }
+        }
+
+        if (Object.prototype.hasOwnProperty.call(this.handlers, 'langWatch')) {
+            const span: LangWatchSpan | undefined = this.handlers['langWatch'].span[returnIds['langWatch'].span]
+            if (span) {
+                span.end({
+                    error
                 })
             }
         }
